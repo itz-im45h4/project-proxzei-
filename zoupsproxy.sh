@@ -145,7 +145,7 @@ trap 'on_error $LINENO' ERR
 
 
 # ============================================================
-# Requirements
+# Requirements 
 # ============================================================
 
 require_not_root() {
@@ -598,6 +598,31 @@ systemd_off() {
         all_proxy ALL_PROXY \
         no_proxy NO_PROXY \
         2>/dev/null || true
+
+    # dbus-update-activation-environment has no per-variable unset option.
+    # Leaving these values behind means a desktop application started through
+    # D-Bus after `off` can still inherit the old proxy.  Replace them with
+    # empty values so newly activated applications, including Firefox, cannot
+    # receive a stale proxy URL.
+    if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+        dbus-update-activation-environment --systemd \
+            http_proxy= https_proxy= \
+            HTTP_PROXY= HTTPS_PROXY= \
+            ftp_proxy= FTP_PROXY= \
+            all_proxy= ALL_PROXY= \
+            no_proxy= NO_PROXY= \
+            2>/dev/null || true
+
+        # The preceding command also updates the user systemd manager; remove
+        # the empty placeholders there after D-Bus has been sanitised.
+        systemctl --user unset-environment \
+            http_proxy https_proxy \
+            HTTP_PROXY HTTPS_PROXY \
+            ftp_proxy FTP_PROXY \
+            all_proxy ALL_PROXY \
+            no_proxy NO_PROXY \
+            2>/dev/null || true
+    fi
 }
 
 
@@ -724,7 +749,11 @@ firefox_profile_dirs() {
 
     local bases=(
         "$HOME/.mozilla/firefox"
+        # Some Arch Firefox packages store the profile under XDG config rather
+        # than the legacy ~/.mozilla location.
+        "$HOME/.config/mozilla/firefox"
         "$HOME/.var/app/org.mozilla.firefox/.mozilla/firefox"
+        "$HOME/snap/firefox/common/.mozilla/firefox"
     )
 
     for base in "${bases[@]}"; do
@@ -839,14 +868,22 @@ firefox_off() {
                 '/^[[:space:]]*\/\/ PROXY-FINAL FIREFOX START$/,/^[[:space:]]*\/\/ PROXY-FINAL FIREFOX END$/d' \
                 "$userjs"
 
-            cat >> "$userjs" <<'EOF'
+        else
+
+            # A profile can exist without user.js (for example, if it was
+            # created while the proxy was enabled).  Create it so OFF always
+            # installs the direct-connection preference.
+            touch "$userjs"
+
+        fi
+
+        cat >> "$userjs" <<'EOF'
 
 // PROXY-FINAL FIREFOX START
 user_pref("network.proxy.type", 0);
+user_pref("network.proxy.autoconfig_url", "");
 // PROXY-FINAL FIREFOX END
 EOF
-
-        fi
 
     done < <(firefox_profile_dirs)
 
@@ -854,6 +891,10 @@ EOF
         warn "No Firefox profiles found while disabling Firefox proxy."
     else
         log "OK: Firefox forced to NO PROXY"
+    fi
+
+    if pgrep -u "$UID" -x firefox >/dev/null 2>&1; then
+        warn "Firefox is still running. Its current session may retain the old proxy until Firefox is fully closed and reopened."
     fi
 }
 
@@ -1451,8 +1492,16 @@ disable_proxy() {
 
         warn "Persistent proxy state is already DISABLED."
 
+        # OFF must be idempotent.  In particular, an older script version may
+        # have removed its state flag without ever finding the user's Firefox
+        # profile.  Still install Firefox's direct-connection preference when
+        # the user runs OFF again.
+        log "Applying Firefox direct-connection cleanup despite missing state."
+        firefox_off
+        systemd_off
+
         echo
-        echo "Nothing was changed."
+        echo "Firefox and runtime proxy cleanup was applied."
         echo
         return 0
 
