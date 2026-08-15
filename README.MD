@@ -87,7 +87,7 @@ These are **always** the fallback values. When you supply a different host/port,
 
 ---
 
-## 🔧 How it works (in plain English)
+## 🔧 How it works 
 
 1. **Turning on (`on`)**:
    - The script checks if a proxy is already active. If not, it **snapshots** every configuration file it will touch (environment, GNOME, pacman, etc.) and stores them in `/var/lib/proxy-toggle-final/originals/`.
