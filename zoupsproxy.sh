@@ -1116,6 +1116,14 @@ pacman_on() {
         '/^[[:space:]]*# PROXY-FINAL PACMAN START$/,/^[[:space:]]*# PROXY-FINAL PACMAN END$/d' \
         "$PACMAN_CONF"
 
+    # Clean entries left by older revisions of this script before inserting
+    # the one active transfer command. Multiple XferCommand entries can make
+    # pacman use a stale HTTP endpoint after switching to SOCKS5.
+    sudo sed -i \
+        '/^[[:space:]]*# PROXY-TOGGLE PACMAN START$/,/^[[:space:]]*# PROXY-TOGGLE PACMAN END$/d;
+         /^[[:space:]]*XferCommand[[:space:]]*=.*\/usr\/bin\/curl.*\(--proxy\|-x\)[[:space:]]/d' \
+        "$PACMAN_CONF"
+
     local tmp
     tmp="$(mktemp)"
 
