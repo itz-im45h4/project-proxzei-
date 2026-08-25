@@ -5,12 +5,13 @@ set -Eeuo pipefail
 # CachyOS / Arch Proxy Toggle - FINAL
 # ============================================================
 #
-# DEFAULT PROXY
+# DEFAULT PROXIES
 # ------------------------------------------------------------
-# This is ALWAYS the default.
+# HTTP and SOCKS5 each have their own default port.
 #
 DEFAULT_HOST="192.168.43.1"
-DEFAULT_PORT="44355"
+DEFAULT_HTTP_PORT="44355"
+DEFAULT_SOCKS_PORT="1080"
 #
 # Supplying another host/port NEVER changes these defaults.
 #
@@ -20,6 +21,7 @@ DEFAULT_PORT="44355"
 #
 # Use default:
 #   ./proxy-toggle-final.sh on
+#   -> choose HTTP (192.168.43.1:44355) or SOCKS5 (192.168.43.1:1080)
 #
 # Temporary runtime override:
 #   ./proxy-toggle-final.sh on 192.168.43.1 44366
@@ -43,6 +45,7 @@ DEFAULT_PORT="44355"
 STATE_DIR="/var/lib/proxy-toggle-final"
 ORIGINALS_DIR="$STATE_DIR/originals"
 ENABLED_FILE="$STATE_DIR/enabled"
+ACTIVE_PROXY_FILE="$STATE_DIR/active-proxy"
 
 ENV_FILE="/etc/environment"
 
@@ -66,6 +69,8 @@ SHELLY_DESKTOP="/usr/share/applications/com.shellyorg.shelly.desktop"
 USER_APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 USER_SHELLY_DESKTOP="$USER_APPS_DIR/com.shellyorg.shelly.desktop"
 
+CODE_SETTINGS_FILE="$HOME/.config/Code - OSS/User/settings.json"
+
 LOG_DIR="$HOME/.local/state/proxy-toggle"
 LOG_FILE="$LOG_DIR/proxy-toggle.log"
 
@@ -76,9 +81,11 @@ LOG_FILE="$LOG_DIR/proxy-toggle.log"
 
 ACTION=""
 HOST="$DEFAULT_HOST"
-PORT="$DEFAULT_PORT"
+PORT=""
+PROXY_TYPE=""
 
 PROXY_URL=""
+ELECTRON_PROXY_URL=""
 NO_PROXY_VAL="localhost,127.0.0.1,::1"
 
 
@@ -173,16 +180,19 @@ parse_arguments() {
     case "${1:-}" in
 
         on)
+            (( $# <= 3 )) || die "Usage: $0 on [host] [port]"
             ACTION="on"
             HOST="${2:-$DEFAULT_HOST}"
-            PORT="${3:-$DEFAULT_PORT}"
+            PORT="${3:-}"
             ;;
 
         off)
+            (( $# == 1 )) || die "Usage: $0 off"
             ACTION="off"
             ;;
 
         status)
+            (( $# == 1 )) || die "Usage: $0 status"
             ACTION="status"
             ;;
 
@@ -195,7 +205,7 @@ parse_arguments() {
             # Supports:
             # HOST PORT on
 
-            if [[ "${3:-}" == "on" ]]; then
+            if (( $# == 3 )) && [[ "${3:-}" == "on" ]]; then
 
                 ACTION="on"
                 HOST="$1"
@@ -212,14 +222,47 @@ parse_arguments() {
 }
 
 
+select_proxy_type() {
+
+    local choice
+
+    echo
+    echo "Select proxy type:"
+    echo "  1) HTTP   (${DEFAULT_HOST}:${DEFAULT_HTTP_PORT})"
+    echo "  2) SOCKS5 (${DEFAULT_HOST}:${DEFAULT_SOCKS_PORT})"
+    read -r -p "Choice [1-2]: " choice
+
+    case "$choice" in
+        1) PROXY_TYPE="http" ;;
+        2) PROXY_TYPE="socks5" ;;
+        *) die "Invalid proxy type. Enter 1 for HTTP or 2 for SOCKS5." ;;
+    esac
+
+    if [[ -z "$PORT" ]]; then
+        case "$PROXY_TYPE" in
+            http) PORT="$DEFAULT_HTTP_PORT" ;;
+            socks5) PORT="$DEFAULT_SOCKS_PORT" ;;
+        esac
+    fi
+}
+
+
 # ============================================================
 # Validate proxy
 # ============================================================
 
 validate_proxy() {
 
-    [[ "$HOST" =~ ^[A-Za-z0-9._:-]+$ ]] ||
-        die "Invalid proxy host: $HOST"
+    [[ "$PROXY_TYPE" == "http" || "$PROXY_TYPE" == "socks5" ]] ||
+        die "Invalid proxy type: $PROXY_TYPE"
+
+    if [[ "$HOST" == *:* ]]; then
+        [[ "$HOST" =~ ^[0-9A-Fa-f:]+$ ]] ||
+            die "Invalid IPv6 proxy host: $HOST"
+    else
+        [[ "$HOST" =~ ^[A-Za-z0-9._-]+$ ]] ||
+            die "Invalid proxy host: $HOST"
+    fi
 
     [[ "$PORT" =~ ^[0-9]+$ ]] ||
         die "Invalid proxy port: $PORT"
@@ -230,7 +273,26 @@ validate_proxy() {
 
 
 set_proxy_values() {
-    PROXY_URL="http://${HOST}:${PORT}"
+
+    local url_host="$HOST"
+
+    # URLs require brackets around literal IPv6 addresses; GNOME, Firefox,
+    # and proxychains continue to receive the unbracketed host value.
+    if [[ "$HOST" == *:* ]]; then
+        url_host="[$HOST]"
+    fi
+
+    case "$PROXY_TYPE" in
+        http)
+            PROXY_URL="http://${url_host}:${PORT}"
+            ELECTRON_PROXY_URL="$PROXY_URL"
+            ;;
+        socks5)
+            PROXY_URL="socks5h://${url_host}:${PORT}"
+            # Chromium/Electron accepts socks5, but not curl's socks5h alias.
+            ELECTRON_PROXY_URL="socks5://${url_host}:${PORT}"
+            ;;
+    esac
 }
 
 
@@ -252,6 +314,40 @@ prepare_state() {
 
 clear_state() {
     sudo rm -rf "$STATE_DIR"
+}
+
+save_active_proxy() {
+    sudo tee "$ACTIVE_PROXY_FILE" >/dev/null <<EOF
+type=$PROXY_TYPE
+host=$HOST
+port=$PORT
+url=$PROXY_URL
+EOF
+}
+
+load_active_proxy() {
+
+    [[ -f "$ACTIVE_PROXY_FILE" ]] || return 1
+
+    local key value
+    while IFS='=' read -r key value; do
+        case "$key" in
+            type) PROXY_TYPE="$value" ;;
+            host) HOST="$value" ;;
+            port) PORT="$value" ;;
+            url) PROXY_URL="$value" ;;
+        esac
+    done < "$ACTIVE_PROXY_FILE"
+
+    [[ "$PROXY_TYPE" == "http" || "$PROXY_TYPE" == "socks5" ]] || return 1
+    if [[ "$HOST" == *:* ]]; then
+        [[ "$HOST" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+    else
+        [[ "$HOST" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    fi
+    [[ "$PORT" =~ ^[0-9]+$ ]] || return 1
+    (( PORT >= 1 && PORT <= 65535 )) || return 1
+    set_proxy_values
 }
 
 
@@ -630,32 +726,33 @@ systemd_off() {
 # GNOME
 # ============================================================
 
+gnome_snapshot_setting() {
+
+    local schema="$1"
+    local key="$2"
+    local name="$3"
+
+    [[ -f "$(state_path "$name")" ]] && return 0
+
+    gsettings get "$schema" "$key" |
+        sudo tee "$(state_path "$name")" >/dev/null
+}
+
+
 gnome_snapshot() {
 
     command -v gsettings >/dev/null 2>&1 ||
         return 0
 
-    if [[ ! -f "$(state_path gnome-mode)" ]]; then
-
-        gsettings get org.gnome.system.proxy mode |
-            sudo tee "$(state_path gnome-mode)" >/dev/null
-
-        gsettings get org.gnome.system.proxy.http host |
-            sudo tee "$(state_path gnome-http-host)" >/dev/null
-
-        gsettings get org.gnome.system.proxy.http port |
-            sudo tee "$(state_path gnome-http-port)" >/dev/null
-
-        gsettings get org.gnome.system.proxy.https host |
-            sudo tee "$(state_path gnome-https-host)" >/dev/null
-
-        gsettings get org.gnome.system.proxy.https port |
-            sudo tee "$(state_path gnome-https-port)" >/dev/null
-
-        gsettings get org.gnome.system.proxy ignore-hosts |
-            sudo tee "$(state_path gnome-ignore-hosts)" >/dev/null
-
-    fi
+    gnome_snapshot_setting org.gnome.system.proxy mode gnome-mode
+    gnome_snapshot_setting org.gnome.system.proxy.http host gnome-http-host
+    gnome_snapshot_setting org.gnome.system.proxy.http port gnome-http-port
+    gnome_snapshot_setting org.gnome.system.proxy.https host gnome-https-host
+    gnome_snapshot_setting org.gnome.system.proxy.https port gnome-https-port
+    gnome_snapshot_setting org.gnome.system.proxy.socks host gnome-socks-host
+    gnome_snapshot_setting org.gnome.system.proxy.socks port gnome-socks-port
+    gnome_snapshot_setting org.gnome.system.proxy use-same-proxy gnome-use-same-proxy
+    gnome_snapshot_setting org.gnome.system.proxy ignore-hosts gnome-ignore-hosts
 }
 
 
@@ -670,11 +767,30 @@ gnome_on() {
 
     gsettings set org.gnome.system.proxy mode manual
 
-    gsettings set org.gnome.system.proxy.http host "$HOST"
-    gsettings set org.gnome.system.proxy.http port "$PORT"
+    if [[ "$PROXY_TYPE" == "socks5" ]]; then
 
-    gsettings set org.gnome.system.proxy.https host "$HOST"
-    gsettings set org.gnome.system.proxy.https port "$PORT"
+        # Clear HTTP/HTTPS endpoints so GNOME applications select the SOCKS
+        # endpoint instead of attempting HTTP CONNECT against a SOCKS server.
+        gsettings set org.gnome.system.proxy use-same-proxy false
+        gsettings set org.gnome.system.proxy.http host ''
+        gsettings set org.gnome.system.proxy.http port 0
+        gsettings set org.gnome.system.proxy.https host ''
+        gsettings set org.gnome.system.proxy.https port 0
+
+        gsettings set org.gnome.system.proxy.socks host "$HOST"
+        gsettings set org.gnome.system.proxy.socks port "$PORT"
+
+    else
+
+        gsettings set org.gnome.system.proxy.http host "$HOST"
+        gsettings set org.gnome.system.proxy.http port "$PORT"
+
+        gsettings set org.gnome.system.proxy.https host "$HOST"
+        gsettings set org.gnome.system.proxy.https port "$PORT"
+
+        gsettings set org.gnome.system.proxy.socks host ''
+        gsettings set org.gnome.system.proxy.socks port 0
+    fi
 
     gsettings set org.gnome.system.proxy ignore-hosts \
         "['localhost','127.0.0.1','::1']"
@@ -717,6 +833,21 @@ gnome_restore() {
         gsettings set org.gnome.system.proxy.https port "$value"
     fi
 
+    if [[ -f "$(state_path gnome-socks-host)" ]]; then
+        value="$(cat "$(state_path gnome-socks-host)")"
+        gsettings set org.gnome.system.proxy.socks host "$value"
+    fi
+
+    if [[ -f "$(state_path gnome-socks-port)" ]]; then
+        value="$(cat "$(state_path gnome-socks-port)")"
+        gsettings set org.gnome.system.proxy.socks port "$value"
+    fi
+
+    if [[ -f "$(state_path gnome-use-same-proxy)" ]]; then
+        value="$(cat "$(state_path gnome-use-same-proxy)")"
+        gsettings set org.gnome.system.proxy use-same-proxy "$value"
+    fi
+
     if [[ -f "$(state_path gnome-ignore-hosts)" ]]; then
         value="$(cat "$(state_path gnome-ignore-hosts)")"
         gsettings set org.gnome.system.proxy ignore-hosts "$value"
@@ -732,8 +863,8 @@ gnome_restore() {
 # FINAL POLICY:
 #
 # ON:
-#   network.proxy.type = 5
-#   Firefox uses the GNOME/system proxy.
+#   Firefox receives explicit HTTP or SOCKS5 settings. Firefox's system
+#   proxy mode is not reliably applying the GNOME SOCKS endpoint here.
 #
 # OFF:
 #   network.proxy.type = 0
@@ -761,7 +892,7 @@ firefox_profile_dirs() {
         [[ -d "$base" ]] || continue
 
         find "$base" \
-            -mindepth 2 \
+            -mindepth 1 \
             -maxdepth 2 \
             -type f \
             -name "prefs.js" \
@@ -772,9 +903,43 @@ firefox_profile_dirs() {
 }
 
 
-firefox_userjs_write() {
+firefox_proxy_preferences() {
 
-    local mode="$1"
+    case "$PROXY_TYPE" in
+        http)
+            cat <<EOF
+user_pref("network.proxy.type", 1);
+user_pref("network.proxy.share_proxy_settings", false);
+user_pref("network.proxy.http", "$HOST");
+user_pref("network.proxy.http_port", $PORT);
+user_pref("network.proxy.ssl", "$HOST");
+user_pref("network.proxy.ssl_port", $PORT);
+user_pref("network.proxy.socks", "");
+user_pref("network.proxy.socks_port", 0);
+user_pref("network.proxy.socks_remote_dns", false);
+user_pref("network.proxy.no_proxies_on", "$NO_PROXY_VAL");
+EOF
+            ;;
+        socks5)
+            cat <<EOF
+user_pref("network.proxy.type", 1);
+user_pref("network.proxy.share_proxy_settings", false);
+user_pref("network.proxy.http", "");
+user_pref("network.proxy.http_port", 0);
+user_pref("network.proxy.ssl", "");
+user_pref("network.proxy.ssl_port", 0);
+user_pref("network.proxy.socks", "$HOST");
+user_pref("network.proxy.socks_port", $PORT);
+user_pref("network.proxy.socks_version", 5);
+user_pref("network.proxy.socks_remote_dns", true);
+user_pref("network.proxy.no_proxies_on", "$NO_PROXY_VAL");
+EOF
+            ;;
+    esac
+}
+
+
+firefox_userjs_write() {
 
     local profile
     local userjs
@@ -822,10 +987,12 @@ firefox_userjs_write() {
 
         fi
 
-        cat >> "$userjs" <<EOF
+        cat >> "$userjs" <<'EOF'
 
 // PROXY-FINAL FIREFOX START
-user_pref("network.proxy.type", $mode);
+EOF
+        firefox_proxy_preferences >> "$userjs"
+        cat >> "$userjs" <<'EOF'
 // PROXY-FINAL FIREFOX END
 EOF
 
@@ -835,13 +1002,46 @@ EOF
         warn "No existing Firefox profiles with prefs.js were detected."
         warn "Firefox may not have been started yet."
     else
-        log "OK: Firefox proxy mode = $mode"
+        log "OK: Firefox proxy = $PROXY_URL"
     fi
 }
 
 
 firefox_on() {
-    firefox_userjs_write 5
+    firefox_userjs_write
+}
+
+
+firefox_configuration_matches_active() {
+
+    local profile
+    local userjs
+
+    while IFS= read -r profile; do
+        [[ -n "$profile" ]] || continue
+        userjs="$profile/user.js"
+
+        [[ -f "$userjs" ]] || continue
+        grep -Fq '// PROXY-FINAL FIREFOX START' "$userjs" || continue
+
+        case "$PROXY_TYPE" in
+            http)
+                grep -Fq "user_pref(\"network.proxy.http\", \"$HOST\");" "$userjs" &&
+                    grep -Fq "user_pref(\"network.proxy.http_port\", $PORT);" "$userjs" &&
+                    grep -Fq "user_pref(\"network.proxy.ssl\", \"$HOST\");" "$userjs" &&
+                    return 0
+                ;;
+            socks5)
+                grep -Fq "user_pref(\"network.proxy.socks\", \"$HOST\");" "$userjs" &&
+                    grep -Fq "user_pref(\"network.proxy.socks_port\", $PORT);" "$userjs" &&
+                    grep -Fq 'user_pref("network.proxy.socks_version", 5);' "$userjs" &&
+                    grep -Fq 'user_pref("network.proxy.socks_remote_dns", true);' "$userjs" &&
+                    return 0
+                ;;
+        esac
+    done < <(firefox_profile_dirs)
+
+    return 1
 }
 
 
@@ -1075,12 +1275,19 @@ proxychains_on() {
 
     snapshot_file "$PROXYCHAINS_CONF" "proxychains.conf"
 
+    # Re-enabling with another type must replace our previous proxy entry,
+    # not append a second hop to the ProxyList.
+    sudo sed -i \
+        '/^[[:space:]]*# PROXY-FINAL SHELLY START$/,/^[[:space:]]*# PROXY-FINAL SHELLY END$/d' \
+        "$PROXYCHAINS_CONF"
+
     local tmp
     tmp="$(mktemp)"
 
-    awk -v host="$HOST" -v port="$PORT" '
+    awk -v type="$PROXY_TYPE" -v host="$HOST" -v port="$PORT" '
         BEGIN {
             inserted=0
+            in_proxy_list=0
         }
 
         /^\[ProxyList\][[:space:]]*$/ {
@@ -1089,10 +1296,24 @@ proxychains_on() {
 
             print ""
             print "# PROXY-FINAL SHELLY START"
-            print "http " host " " port
+            print type " " host " " port
             print "# PROXY-FINAL SHELLY END"
 
             inserted=1
+            in_proxy_list=1
+            next
+        }
+
+        /^\[[^]]+\][[:space:]]*$/ {
+            in_proxy_list=0
+            print
+            next
+        }
+
+        # While enabled, proxychains must use only the proxy selected by this
+        # script.  Original active entries are safely restored from the
+        # snapshot when the user runs `off`.
+        in_proxy_list && $0 !~ /^[[:space:]]*(#|$)/ {
             next
         }
 
@@ -1107,7 +1328,7 @@ proxychains_on() {
                 print ""
                 print "[ProxyList]"
                 print "# PROXY-FINAL SHELLY START"
-                print "http " host " " port
+                print type " " host " " port
                 print "# PROXY-FINAL SHELLY END"
 
             }
@@ -1223,6 +1444,58 @@ shelly_desktop_restore() {
 
 
 # ============================================================
+# VISUAL STUDIO CODE SETTINGS
+# ============================================================
+
+vscode_on() {
+
+    log "Configuring VS Code settings..."
+
+    snapshot_file "$CODE_SETTINGS_FILE" "vscode-settings.json"
+    mkdir -p "$(dirname "$CODE_SETTINGS_FILE")"
+
+    [[ -f "$CODE_SETTINGS_FILE" ]] || printf '{}\n' > "$CODE_SETTINGS_FILE"
+
+    local tmp
+    tmp="$(mktemp)"
+
+    if ! jq \
+        --arg proxy "$ELECTRON_PROXY_URL" \
+        '. + {"http.proxy": $proxy, "http.proxySupport": "override"}' \
+        "$CODE_SETTINGS_FILE" > "$tmp"; then
+        rm -f "$tmp"
+        die "VS Code settings are not valid JSON: $CODE_SETTINGS_FILE"
+    fi
+
+    cp "$tmp" "$CODE_SETTINGS_FILE"
+    rm -f "$tmp"
+
+    log "OK: VS Code http.proxy = $ELECTRON_PROXY_URL"
+}
+
+
+vscode_restore() {
+    restore_file "$CODE_SETTINGS_FILE" "vscode-settings.json"
+}
+
+
+vscode_configuration_matches_active() {
+    [[ -f "$CODE_SETTINGS_FILE" ]] &&
+        jq -e \
+            --arg proxy "$ELECTRON_PROXY_URL" \
+            '."http.proxy" == $proxy and ."http.proxySupport" == "override"' \
+            "$CODE_SETTINGS_FILE" >/dev/null 2>&1
+}
+
+
+vscode_restart_warning() {
+    if pgrep -u "$UID" -f '(^|/)(code|code-oss)( |$)' >/dev/null 2>&1; then
+        warn "VS Code is still running. Fully close and reopen it so Codex and other extensions read the new settings."
+    fi
+}
+
+
+# ============================================================
 # CONNECTION TEST
 # ============================================================
 
@@ -1262,10 +1535,19 @@ status() {
 
     fi
 
-    echo "Default proxy:      http://${DEFAULT_HOST}:${DEFAULT_PORT}"
+    echo "HTTP default:       http://${DEFAULT_HOST}:${DEFAULT_HTTP_PORT}"
+    echo "SOCKS5 default:     socks5h://${DEFAULT_HOST}:${DEFAULT_SOCKS_PORT}"
+
+    local active_proxy_loaded=0
 
     if is_enabled; then
-        echo "Active proxy:       $PROXY_URL"
+        if load_active_proxy; then
+            active_proxy_loaded=1
+            echo "Active type:        $PROXY_TYPE"
+            echo "Active proxy:       $PROXY_URL"
+        else
+            echo "Active proxy:       metadata unavailable"
+        fi
     fi
 
     echo
@@ -1364,7 +1646,29 @@ status() {
 
     fi
 
-    if is_enabled; then
+    printf "VS Code settings:   "
+
+    if (( active_proxy_loaded )) && vscode_configuration_matches_active; then
+        echo "active $PROXY_TYPE / override"
+    elif [[ -f "$CODE_SETTINGS_FILE" ]] &&
+         jq -e '."http.proxySupport" == "override" and (."http.proxy" | type == "string")' \
+             "$CODE_SETTINGS_FILE" >/dev/null 2>&1; then
+        echo "configured for another proxy"
+    else
+        echo "not configured"
+    fi
+
+    printf "Firefox:            "
+
+    if (( active_proxy_loaded )) && firefox_configuration_matches_active; then
+        echo "active $PROXY_TYPE"
+    elif (( active_proxy_loaded )); then
+        echo "does not match active proxy"
+    else
+        echo "active proxy metadata unavailable"
+    fi
+
+    if (( active_proxy_loaded )); then
 
         printf "Proxy connectivity: "
 
@@ -1391,6 +1695,7 @@ status() {
 enable_proxy() {
 
     require_sudo
+    select_proxy_type
     validate_proxy
     set_proxy_values
 
@@ -1399,7 +1704,8 @@ enable_proxy() {
     log "Proxy: $PROXY_URL"
 
     if [[ "$HOST" == "$DEFAULT_HOST" &&
-          "$PORT" == "$DEFAULT_PORT" ]]; then
+          ( ( "$PROXY_TYPE" == "http" && "$PORT" == "$DEFAULT_HTTP_PORT" ) ||
+            ( "$PROXY_TYPE" == "socks5" && "$PORT" == "$DEFAULT_SOCKS_PORT" ) ) ]]; then
 
         log "Using hard-coded DEFAULT proxy."
 
@@ -1407,7 +1713,8 @@ enable_proxy() {
 
         log "Using RUNTIME OVERRIDE."
         log "Hard-coded default remains:"
-        log "  ${DEFAULT_HOST}:${DEFAULT_PORT}"
+        log "  HTTP: ${DEFAULT_HOST}:${DEFAULT_HTTP_PORT}"
+        log "  SOCKS5: ${DEFAULT_HOST}:${DEFAULT_SOCKS_PORT}"
 
     fi
 
@@ -1441,6 +1748,7 @@ enable_proxy() {
 
     shelly_wrappers_on
     shelly_desktop_on
+    vscode_on
 
     firefox_on
 
@@ -1448,6 +1756,7 @@ enable_proxy() {
 
     set_current_proxy_environment
 
+    save_active_proxy
     sudo touch "$ENABLED_FILE"
 
     echo
@@ -1455,6 +1764,7 @@ enable_proxy() {
     echo "             PROXY ENABLED"
     echo "=============================================="
     echo
+    echo "Active type:   $PROXY_TYPE"
     echo "Active proxy:  $PROXY_URL"
     echo
     echo "[OK] Environment"
@@ -1469,8 +1779,10 @@ enable_proxy() {
     echo "[OK] Shelly CLI"
     echo "[OK] Shelly GUI"
     echo "[OK] GNOME Shelly launcher"
-    echo "[OK] Firefox → system proxy"
+    echo "[OK] VS Code settings / Codex / AI extensions"
+    echo "[OK] Firefox → explicit $PROXY_TYPE proxy"
     echo
+    vscode_restart_warning
     echo "Configuration persists across reboot/login."
     echo
 }
@@ -1525,6 +1837,7 @@ disable_proxy() {
     restore_file "$SHELLY_UI_WRAPPER" "shelly-ui-wrapper"
 
     shelly_desktop_restore
+    vscode_restore
 
     # Firefox is intentionally forced to DIRECT.
     # This handles old Firefox proxy settings which may have
@@ -1540,6 +1853,8 @@ disable_proxy() {
 
     clear_state
 
+    vscode_restart_warning
+
     echo
     echo "=============================================="
     echo "             PROXY DISABLED"
@@ -1547,6 +1862,7 @@ disable_proxy() {
     echo
     echo "System proxy configuration restored."
     echo "Firefox forced to DIRECT / NO PROXY."
+    echo "VS Code settings restored."
     echo
     echo "IMPORTANT:"
     echo "  Fully close Firefox and open it again."
@@ -1592,10 +1908,10 @@ case "$ACTION" in
         echo "Examples:"
         echo
         echo "  $0 on"
-        echo "      -> uses default ${DEFAULT_HOST}:${DEFAULT_PORT}"
+        echo "      -> prompts for HTTP or SOCKS5"
         echo
         echo "  $0 on 192.168.43.1 44366"
-        echo "      -> uses that proxy for this activation"
+        echo "      -> prompts for type and uses that endpoint"
         echo
         echo "  $0 192.168.43.1 44366 on"
         echo "      -> same runtime override"
