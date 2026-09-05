@@ -69,7 +69,19 @@ SHELLY_DESKTOP="/usr/share/applications/com.shellyorg.shelly.desktop"
 USER_APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 USER_SHELLY_DESKTOP="$USER_APPS_DIR/com.shellyorg.shelly.desktop"
 
-CODE_SETTINGS_FILE="$HOME/.config/Code - OSS/User/settings.json"
+STEAM_BIN="/usr/bin/steam"
+USER_STEAM_SH="$HOME/.local/share/Steam/steam.sh"
+USER_STEAM_WRAPPER="$HOME/.local/bin/steam"
+STEAM_WRAPPER="/usr/local/bin/steam"
+STEAM_DESKTOP="/usr/share/applications/steam.desktop"
+USER_STEAM_DESKTOP="$USER_APPS_DIR/steam.desktop"
+
+CODE_SETTINGS_FILES=(
+    "$HOME/.config/Code - OSS/User/settings.json"
+    "$HOME/.config/Code/User/settings.json"
+)
+CODE_SETTINGS_FILE="${CODE_SETTINGS_FILES[0]}"
+CODEX_CONFIG_FILE="$HOME/.codex/config.toml"
 
 LOG_DIR="$HOME/.local/state/proxy-toggle"
 LOG_FILE="$LOG_DIR/proxy-toggle.log"
@@ -86,6 +98,7 @@ PROXY_TYPE=""
 
 PROXY_URL=""
 ELECTRON_PROXY_URL=""
+VSCODE_PROXY_URL=""
 NO_PROXY_VAL="localhost,127.0.0.1,::1"
 
 
@@ -271,6 +284,16 @@ validate_proxy() {
         die "Proxy port must be between 1 and 65535."
 }
 
+check_python_socks() {
+    if [[ "$PROXY_TYPE" == "socks5" ]]; then
+        if ! python3 -c "import socks" >/dev/null 2>&1; then
+            warn "python-pysocks is NOT installed on this system."
+            warn "Python applications (like ProtonUp-Qt) will crash when using SOCKS5."
+            warn "To fix this, install python-pysocks: sudo pacman -S python-pysocks"
+        fi
+    fi
+}
+
 
 set_proxy_values() {
 
@@ -286,11 +309,20 @@ set_proxy_values() {
         http)
             PROXY_URL="http://${url_host}:${PORT}"
             ELECTRON_PROXY_URL="$PROXY_URL"
+            VSCODE_PROXY_URL="$PROXY_URL"
             ;;
         socks5)
             PROXY_URL="socks5h://${url_host}:${PORT}"
             # Chromium/Electron accepts socks5, but not curl's socks5h alias.
             ELECTRON_PROXY_URL="socks5://${url_host}:${PORT}"
+            # VS Code extensions like OpenAI Codex use reqwest/hyper which do not support SOCKS5.
+            # Check if an HTTP proxy endpoint is active on DEFAULT_HTTP_PORT (44355) on this host.
+            local check_port="${DEFAULT_HTTP_PORT:-44355}"
+            if python3 -c "import socket; s = socket.socket(); s.settimeout(0.5); s.connect(('$HOST', $check_port)); s.close()" 2>/dev/null; then
+                VSCODE_PROXY_URL="http://${url_host}:${check_port}"
+            else
+                VSCODE_PROXY_URL="socks5://${url_host}:${PORT}"
+            fi
             ;;
     esac
 }
@@ -471,14 +503,11 @@ environment_on() {
 
     log "Configuring /etc/environment..."
 
-    snapshot_file "$ENV_FILE" "environment"
-
+    # Clean existing proxy blocks before snapshotting so original is never dirty
     sudo sed -i \
-        '/^[[:space:]]*# PROXY-FINAL START$/,/^[[:space:]]*# PROXY-FINAL END$/d' \
-        "$ENV_FILE"
-
-    sudo sed -i \
-        '/^[[:space:]]*http_proxy=/d;
+        '/^[[:space:]]*# PROXY-FINAL START$/,/^[[:space:]]*# PROXY-FINAL END$/d;
+         /^[[:space:]]*# PROXY-TOGGLE START$/,/^[[:space:]]*# PROXY-TOGGLE END$/d;
+         /^[[:space:]]*http_proxy=/d;
          /^[[:space:]]*https_proxy=/d;
          /^[[:space:]]*HTTP_PROXY=/d;
          /^[[:space:]]*HTTPS_PROXY=/d;
@@ -488,7 +517,9 @@ environment_on() {
          /^[[:space:]]*ALL_PROXY=/d;
          /^[[:space:]]*no_proxy=/d;
          /^[[:space:]]*NO_PROXY=/d' \
-        "$ENV_FILE"
+        "$ENV_FILE" 2>/dev/null || true
+
+    snapshot_file "$ENV_FILE" "environment"
 
     sudo tee -a "$ENV_FILE" >/dev/null <<EOF
 
@@ -507,6 +538,25 @@ NO_PROXY=$NO_PROXY_VAL
 EOF
 
     log "OK: /etc/environment"
+}
+
+environment_off() {
+    restore_file "$ENV_FILE" "environment"
+    sudo sed -i \
+        '/^[[:space:]]*# PROXY-FINAL START$/,/^[[:space:]]*# PROXY-FINAL END$/d;
+         /^[[:space:]]*# PROXY-TOGGLE START$/,/^[[:space:]]*# PROXY-TOGGLE END$/d;
+         /^[[:space:]]*http_proxy=/d;
+         /^[[:space:]]*https_proxy=/d;
+         /^[[:space:]]*HTTP_PROXY=/d;
+         /^[[:space:]]*HTTPS_PROXY=/d;
+         /^[[:space:]]*ftp_proxy=/d;
+         /^[[:space:]]*FTP_PROXY=/d;
+         /^[[:space:]]*all_proxy=/d;
+         /^[[:space:]]*ALL_PROXY=/d;
+         /^[[:space:]]*no_proxy=/d;
+         /^[[:space:]]*NO_PROXY=/d' \
+        "$ENV_FILE" 2>/dev/null || true
+    log "OK: /etc/environment restored"
 }
 
 
@@ -695,11 +745,23 @@ systemd_off() {
         no_proxy NO_PROXY \
         2>/dev/null || true
 
-    # dbus-update-activation-environment has no per-variable unset option.
-    # Leaving these values behind means a desktop application started through
-    # D-Bus after `off` can still inherit the old proxy.  Replace them with
-    # empty values so newly activated applications, including Firefox, cannot
-    # receive a stale proxy URL.
+    # If any proxy variables linger in systemd --user (for example, if systemd was
+    # started when /etc/environment had proxy variables), unsetting them can unmask
+    # the initial environment. Set them to empty values so new terminals/apps do not
+    # inherit a stale proxy.
+    local lingering
+    lingering="$(systemctl --user show-environment 2>/dev/null | grep -E '^(http_proxy|https_proxy|HTTP_PROXY|HTTPS_PROXY|ftp_proxy|FTP_PROXY|all_proxy|ALL_PROXY)=.+' || true)"
+    if [[ -n "$lingering" ]]; then
+        systemctl --user set-environment \
+            http_proxy= https_proxy= \
+            HTTP_PROXY= HTTPS_PROXY= \
+            ftp_proxy= FTP_PROXY= \
+            all_proxy= ALL_PROXY= \
+            no_proxy= NO_PROXY= \
+            2>/dev/null || true
+    fi
+
+    # Ensure D-Bus session activation environment is also sanitized.
     if command -v dbus-update-activation-environment >/dev/null 2>&1; then
         dbus-update-activation-environment --systemd \
             http_proxy= https_proxy= \
@@ -707,16 +769,6 @@ systemd_off() {
             ftp_proxy= FTP_PROXY= \
             all_proxy= ALL_PROXY= \
             no_proxy= NO_PROXY= \
-            2>/dev/null || true
-
-        # The preceding command also updates the user systemd manager; remove
-        # the empty placeholders there after D-Bus has been sanitised.
-        systemctl --user unset-environment \
-            http_proxy https_proxy \
-            HTTP_PROXY HTTPS_PROXY \
-            ftp_proxy FTP_PROXY \
-            all_proxy ALL_PROXY \
-            no_proxy NO_PROXY \
             2>/dev/null || true
     fi
 }
@@ -744,7 +796,16 @@ gnome_snapshot() {
     command -v gsettings >/dev/null 2>&1 ||
         return 0
 
-    gnome_snapshot_setting org.gnome.system.proxy mode gnome-mode
+    local current_mode
+    current_mode="$(gsettings get org.gnome.system.proxy mode 2>/dev/null || echo "'none'")"
+    # Never snapshot 'manual' as the clean state to restore to
+    if [[ "$current_mode" == "'manual'" || "$current_mode" == "manual" ]]; then
+        sudo mkdir -p "$ORIGINALS_DIR"
+        echo "'none'" | sudo tee "$(state_path gnome-mode)" >/dev/null
+    else
+        gnome_snapshot_setting org.gnome.system.proxy mode gnome-mode
+    fi
+
     gnome_snapshot_setting org.gnome.system.proxy.http host gnome-http-host
     gnome_snapshot_setting org.gnome.system.proxy.http port gnome-http-port
     gnome_snapshot_setting org.gnome.system.proxy.https host gnome-https-host
@@ -806,46 +867,67 @@ gnome_restore() {
 
     log "Restoring GNOME proxy settings..."
 
-    local value
+    local value="none"
 
     if [[ -f "$(state_path gnome-mode)" ]]; then
         value="$(cat "$(state_path gnome-mode)")"
-        gsettings set org.gnome.system.proxy mode "$value"
+        # If the saved mode was manual, do NOT restore to manual. Restore to none.
+        if [[ "$value" == "'manual'" || "$value" == "manual" ]]; then
+            value="none"
+        else
+            value="${value//\'/}"
+        fi
     fi
+
+    gsettings set org.gnome.system.proxy mode "$value"
 
     if [[ -f "$(state_path gnome-http-host)" ]]; then
         value="$(cat "$(state_path gnome-http-host)")"
         gsettings set org.gnome.system.proxy.http host "$value"
+    else
+        gsettings set org.gnome.system.proxy.http host ''
     fi
 
     if [[ -f "$(state_path gnome-http-port)" ]]; then
         value="$(cat "$(state_path gnome-http-port)")"
         gsettings set org.gnome.system.proxy.http port "$value"
+    else
+        gsettings set org.gnome.system.proxy.http port 0
     fi
 
     if [[ -f "$(state_path gnome-https-host)" ]]; then
         value="$(cat "$(state_path gnome-https-host)")"
         gsettings set org.gnome.system.proxy.https host "$value"
+    else
+        gsettings set org.gnome.system.proxy.https host ''
     fi
 
     if [[ -f "$(state_path gnome-https-port)" ]]; then
         value="$(cat "$(state_path gnome-https-port)")"
         gsettings set org.gnome.system.proxy.https port "$value"
+    else
+        gsettings set org.gnome.system.proxy.https port 0
     fi
 
     if [[ -f "$(state_path gnome-socks-host)" ]]; then
         value="$(cat "$(state_path gnome-socks-host)")"
         gsettings set org.gnome.system.proxy.socks host "$value"
+    else
+        gsettings set org.gnome.system.proxy.socks host ''
     fi
 
     if [[ -f "$(state_path gnome-socks-port)" ]]; then
         value="$(cat "$(state_path gnome-socks-port)")"
         gsettings set org.gnome.system.proxy.socks port "$value"
+    else
+        gsettings set org.gnome.system.proxy.socks port 0
     fi
 
     if [[ -f "$(state_path gnome-use-same-proxy)" ]]; then
         value="$(cat "$(state_path gnome-use-same-proxy)")"
         gsettings set org.gnome.system.proxy use-same-proxy "$value"
+    else
+        gsettings set org.gnome.system.proxy use-same-proxy false
     fi
 
     if [[ -f "$(state_path gnome-ignore-hosts)" ]]; then
@@ -1110,11 +1192,15 @@ pacman_on() {
 
     log "Configuring pacman/makepkg..."
 
-    snapshot_file "$PACMAN_CONF" "pacman.conf"
-
+    # Clean entries left by older revisions or previous sessions before snapshotting
+    # so the snapshot is always clean and free of stale proxy entries.
     sudo sed -i \
-        '/^[[:space:]]*# PROXY-FINAL PACMAN START$/,/^[[:space:]]*# PROXY-FINAL PACMAN END$/d' \
-        "$PACMAN_CONF"
+        '/^[[:space:]]*# PROXY-FINAL PACMAN START$/,/^[[:space:]]*# PROXY-FINAL PACMAN END$/d;
+         /^[[:space:]]*# PROXY-TOGGLE PACMAN START$/,/^[[:space:]]*# PROXY-TOGGLE PACMAN END$/d;
+         /^[[:space:]]*XferCommand[[:space:]]*=.*\/usr\/bin\/curl.*\(--proxy\|-x\)[[:space:]]/d' \
+        "$PACMAN_CONF" 2>/dev/null || true
+
+    snapshot_file "$PACMAN_CONF" "pacman.conf"
 
     local tmp
     tmp="$(mktemp)"
@@ -1129,7 +1215,7 @@ pacman_on() {
             print
             print ""
             print "# PROXY-FINAL PACMAN START"
-            print "XferCommand = /usr/bin/curl --proxy \"" proxy "\" --location --continue-at - --fail --output %o %u"
+            print "XferCommand = /usr/bin/curl --proxy \"" proxy "\" --location --continue-at - --fail --retry 3 --retry-delay 2 --connect-timeout 10 --speed-time 20 --speed-limit 1024 --output %o %u"
             print "# PROXY-FINAL PACMAN END"
 
             inserted=1
@@ -1163,6 +1249,17 @@ pacman_on() {
     log "OK: pacman XferCommand = $PROXY_URL"
 }
 
+pacman_off() {
+    restore_file "$PACMAN_CONF" "pacman.conf"
+    # Ensure no lingering proxy XferCommand survives in pacman.conf
+    sudo sed -i \
+        '/^[[:space:]]*# PROXY-FINAL PACMAN START$/,/^[[:space:]]*# PROXY-FINAL PACMAN END$/d;
+         /^[[:space:]]*# PROXY-TOGGLE PACMAN START$/,/^[[:space:]]*# PROXY-TOGGLE PACMAN END$/d;
+         /^[[:space:]]*XferCommand[[:space:]]*=.*\/usr\/bin\/curl.*\(--proxy\|-x\)[[:space:]]/d' \
+        "$PACMAN_CONF" 2>/dev/null || true
+    log "OK: pacman restored"
+}
+
 
 # ============================================================
 # FLATPAK
@@ -1178,6 +1275,12 @@ flatpak_on() {
     log "Configuring Flatpak..."
 
     sudo mkdir -p /etc/flatpak
+
+    # Clean existing proxy blocks before snapshotting so original is never dirty
+    sudo sed -i \
+        '/^[[:space:]]*# PROXY-FINAL FLATPAK START$/,/^[[:space:]]*# PROXY-FINAL FLATPAK END$/d;
+         /^[[:space:]]*# PROXY-TOGGLE FLATPAK START$/,/^[[:space:]]*# PROXY-TOGGLE FLATPAK END$/d' \
+        "$FLATPAK_CONF" 2>/dev/null || true
 
     snapshot_file "$FLATPAK_CONF" "flatpak-config"
 
@@ -1259,6 +1362,22 @@ flatpak_on() {
     log "OK: Flatpak proxy = $PROXY_URL"
 }
 
+flatpak_off() {
+    command -v flatpak >/dev/null 2>&1 || return 0
+    restore_file "$FLATPAK_CONF" "flatpak-config"
+    sudo sed -i \
+        '/^[[:space:]]*# PROXY-FINAL FLATPAK START$/,/^[[:space:]]*# PROXY-FINAL FLATPAK END$/d;
+         /^[[:space:]]*# PROXY-TOGGLE FLATPAK START$/,/^[[:space:]]*# PROXY-TOGGLE FLATPAK END$/d' \
+        "$FLATPAK_CONF" 2>/dev/null || true
+    if [[ -f "$FLATPAK_CONF" ]]; then
+        if ! grep -q -E '[^[:space:]]' "$FLATPAK_CONF" || [[ "$(grep -v '^[[:space:]]*$' "$FLATPAK_CONF" | tr -d '[:space:]')" == "[system]" ]]; then
+            sudo rm -f "$FLATPAK_CONF"
+        fi
+    fi
+    sudo systemctl restart flatpak-system-helper.service 2>/dev/null || true
+    log "OK: Flatpak restored"
+}
+
 
 # ============================================================
 # PROXYCHAINS
@@ -1272,6 +1391,12 @@ proxychains_on() {
         die "$PROXYCHAINS_CONF does not exist."
 
     log "Configuring proxychains..."
+
+    # Clean existing proxy blocks before snapshotting so original is never dirty
+    sudo sed -i \
+        '/^[[:space:]]*# PROXY-FINAL SHELLY START$/,/^[[:space:]]*# PROXY-FINAL SHELLY END$/d;
+         /^[[:space:]]*# PROXY-TOGGLE.*START$/,/^[[:space:]]*# PROXY-TOGGLE.*END$/d' \
+        "$PROXYCHAINS_CONF" 2>/dev/null || true
 
     snapshot_file "$PROXYCHAINS_CONF" "proxychains.conf"
 
@@ -1342,6 +1467,15 @@ proxychains_on() {
     rm -f "$tmp"
 
     log "OK: proxychains = $PROXY_URL"
+}
+
+proxychains_off() {
+    restore_file "$PROXYCHAINS_CONF" "proxychains.conf"
+    sudo sed -i \
+        '/^[[:space:]]*# PROXY-FINAL SHELLY START$/,/^[[:space:]]*# PROXY-FINAL SHELLY END$/d;
+         /^[[:space:]]*# PROXY-TOGGLE.*START$/,/^[[:space:]]*# PROXY-TOGGLE.*END$/d' \
+        "$PROXYCHAINS_CONF" 2>/dev/null || true
+    log "OK: proxychains restored"
 }
 
 
@@ -1444,45 +1578,251 @@ shelly_desktop_restore() {
 
 
 # ============================================================
+# STEAM
+# ============================================================
+
+steam_wrappers_on() {
+    # If neither /usr/bin/steam nor user steam.sh exists, skip
+    if [[ ! -x "$STEAM_BIN" && ! -x "$USER_STEAM_SH" ]]; then
+        return 0
+    fi
+
+    log "Configuring Steam wrapper..."
+
+    snapshot_file "$STEAM_WRAPPER" "steam-wrapper"
+    snapshot_file "$USER_STEAM_WRAPPER" "user-steam-wrapper"
+
+    local steam_http_proxy=""
+    if [[ "$PROXY_TYPE" == "http" ]]; then
+        steam_http_proxy="$PROXY_URL"
+    else
+        local check_port="${DEFAULT_HTTP_PORT:-44355}"
+        if python3 -c "import socket; s = socket.socket(); s.settimeout(0.5); s.connect(('$HOST', $check_port)); s.close()" 2>/dev/null; then
+            steam_http_proxy="http://${HOST}:${check_port}"
+        fi
+    fi
+
+    local tmp_wrapper
+    tmp_wrapper="$(mktemp)"
+
+    cat > "$tmp_wrapper" <<EOF
+#!/usr/bin/env bash
+# Steam bootstrap updater and CEF UI fail when http_proxy starts with socks5h://
+TARGET_STEAM="/usr/bin/steam"
+if [[ ! -x "\$TARGET_STEAM" && -x "\$HOME/.local/share/Steam/steam.sh" ]]; then
+    TARGET_STEAM="\$HOME/.local/share/Steam/steam.sh"
+fi
+
+# Ensure 64-bit LD_PRELOAD (proxychains) is stripped so 32-bit Steam doesn't warn
+unset LD_PRELOAD
+
+EOF
+
+    if [[ -n "$steam_http_proxy" ]]; then
+        cat >> "$tmp_wrapper" <<EOF
+export http_proxy="$steam_http_proxy"
+export https_proxy="$steam_http_proxy"
+export HTTP_PROXY="$steam_http_proxy"
+export HTTPS_PROXY="$steam_http_proxy"
+unset all_proxy ALL_PROXY ftp_proxy FTP_PROXY
+
+exec "\$TARGET_STEAM" "\$@"
+EOF
+    else
+        cat >> "$tmp_wrapper" <<'EOF'
+if command -v proxychains4 >/dev/null 2>&1; then
+    exec env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY -u ftp_proxy -u FTP_PROXY \
+        /usr/bin/proxychains4 -q "$TARGET_STEAM" "$@"
+else
+    exec env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY -u ftp_proxy -u FTP_PROXY \
+        "$TARGET_STEAM" "$@"
+fi
+EOF
+    fi
+
+    # Install user wrapper (~/.local/bin/steam) - no sudo required, overrides /usr/local/bin in PATH
+    mkdir -p "$(dirname "$USER_STEAM_WRAPPER")"
+    cp "$tmp_wrapper" "$USER_STEAM_WRAPPER"
+    chmod 0755 "$USER_STEAM_WRAPPER"
+
+    # Install system wrapper (/usr/local/bin/steam) if sudo is available
+    if command -v sudo >/dev/null 2>&1; then
+        sudo mkdir -p /usr/local/bin 2>/dev/null || true
+        sudo cp "$tmp_wrapper" "$STEAM_WRAPPER" 2>/dev/null || true
+        sudo chmod 0755 "$STEAM_WRAPPER" 2>/dev/null || true
+    fi
+    rm -f "$tmp_wrapper"
+
+    log "OK: Steam wrapper ($USER_STEAM_WRAPPER)"
+
+    if [[ -f "$STEAM_DESKTOP" ]]; then
+        snapshot_file "$USER_STEAM_DESKTOP" "user-steam.desktop"
+        mkdir -p "$USER_APPS_DIR"
+        cp "$STEAM_DESKTOP" "$USER_STEAM_DESKTOP"
+        sed -i "s#Exec=/usr/bin/steam#Exec=$USER_STEAM_WRAPPER#g; s#Exec=steam#Exec=$USER_STEAM_WRAPPER#g" "$USER_STEAM_DESKTOP"
+        update-desktop-database "$USER_APPS_DIR" >/dev/null 2>&1 || true
+        log "OK: GNOME Steam launcher"
+    fi
+}
+
+steam_wrappers_off() {
+    restore_file "$STEAM_WRAPPER" "steam-wrapper"
+    restore_file "$USER_STEAM_WRAPPER" "user-steam-wrapper"
+    rm -f "$USER_STEAM_WRAPPER" 2>/dev/null || true
+    sudo rm -f "$STEAM_WRAPPER" 2>/dev/null || true
+
+    local backup missing
+    backup="$(state_path user-steam.desktop)"
+    missing="$(state_path user-steam.desktop.missing)"
+    if [[ -e "$backup" ]]; then
+        mkdir -p "$USER_APPS_DIR"
+        rm -f "$USER_STEAM_DESKTOP"
+        cp "$backup" "$USER_STEAM_DESKTOP"
+    elif [[ -f "$missing" || ! -f "$STEAM_DESKTOP" ]]; then
+        rm -f "$USER_STEAM_DESKTOP"
+    fi
+    update-desktop-database "$USER_APPS_DIR" >/dev/null 2>&1 || true
+    log "OK: Steam wrapper restored"
+}
+
+
+# ============================================================
+# SHELL INTEGRATION
+# ============================================================
+
+install_shell_functions() {
+    local fish_func_dir="$HOME/.config/fish/functions"
+    mkdir -p "$fish_func_dir"
+    local script_abs_path
+    script_abs_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+    cat > "$fish_func_dir/zoupsproxy.fish" <<FISH_EOF
+function zoupsproxy --description 'Proxy Toggle with automatic shell environment synchronization'
+    set -l script_path "$script_abs_path"
+    if not test -x "\$script_path"
+        echo "Error: \$script_path not found or not executable"
+        return 1
+    end
+
+    \$script_path \$argv
+    set -l exit_code \$status
+
+    if test "\$argv[1]" = "off"
+        set -e http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ftp_proxy FTP_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY
+    else if test "\$argv[1]" = "on"
+        if test -f /etc/fish/conf.d/proxy.fish
+            source /etc/fish/conf.d/proxy.fish
+        end
+    end
+
+    return \$exit_code
+end
+FISH_EOF
+
+    cat > "$fish_func_dir/proxy-toggle.fish" <<FISH_EOF
+function proxy-toggle --wraps zoupsproxy --description 'Alias for zoupsproxy'
+    zoupsproxy \$argv
+end
+FISH_EOF
+}
+
+
+# ============================================================
 # VISUAL STUDIO CODE SETTINGS
 # ============================================================
 
 vscode_on() {
 
-    log "Configuring VS Code settings..."
+    log "Configuring VS Code & Codex settings..."
 
-    snapshot_file "$CODE_SETTINGS_FILE" "vscode-settings.json"
-    mkdir -p "$(dirname "$CODE_SETTINGS_FILE")"
+    # 1. Clean up stale/unmanaged wrappers in /usr/local/bin that break Codex
+    sudo rm -f /usr/local/bin/code /usr/local/bin/code-oss 2>/dev/null || true
 
-    [[ -f "$CODE_SETTINGS_FILE" ]] || printf '{}\n' > "$CODE_SETTINGS_FILE"
+    # 2. Configure VS Code settings.json
+    local settings_file
+    for settings_file in "${CODE_SETTINGS_FILES[@]}"; do
+        if [[ -d "$(dirname "$(dirname "$settings_file")")" || "$settings_file" == *"- OSS"* ]]; then
+            local snap_name
+            snap_name="$(basename "$(dirname "$(dirname "$settings_file")")")-vscode-settings.json"
+            snapshot_file "$settings_file" "$snap_name"
+            mkdir -p "$(dirname "$settings_file")"
 
-    local tmp
-    tmp="$(mktemp)"
+            [[ -f "$settings_file" ]] || printf '{}\n' > "$settings_file"
 
-    if ! jq \
-        --arg proxy "$ELECTRON_PROXY_URL" \
-        '. + {"http.proxy": $proxy, "http.proxySupport": "override"}' \
-        "$CODE_SETTINGS_FILE" > "$tmp"; then
-        rm -f "$tmp"
-        die "VS Code settings are not valid JSON: $CODE_SETTINGS_FILE"
+            local tmp
+            tmp="$(mktemp)"
+
+            if jq \
+                --arg proxy "$VSCODE_PROXY_URL" \
+                '. + {"http.proxy": $proxy, "http.proxySupport": "override", "http.proxyStrictSSL": false}' \
+                "$settings_file" > "$tmp"; then
+                cp "$tmp" "$settings_file"
+                rm -f "$tmp"
+                log "OK: VS Code ($(basename "$(dirname "$(dirname "$settings_file")")")) http.proxy = $VSCODE_PROXY_URL"
+            else
+                rm -f "$tmp"
+                warn "Failed to update $settings_file (invalid JSON)"
+            fi
+        fi
+    done
+
+    # 3. Configure ~/.codex/config.toml if Codex CLI/extension is present
+    if [[ -d "$HOME/.codex" || -f "$CODEX_CONFIG_FILE" ]]; then
+        snapshot_file "$CODEX_CONFIG_FILE" "codex-config.toml"
+        mkdir -p "$(dirname "$CODEX_CONFIG_FILE")"
+        [[ -f "$CODEX_CONFIG_FILE" ]] || touch "$CODEX_CONFIG_FILE"
+
+        sed -i '/^[[:space:]]*\[network\]/,/^[[:space:]]*proxy_url[[:space:]]*=/d' "$CODEX_CONFIG_FILE" 2>/dev/null || true
+        cat >> "$CODEX_CONFIG_FILE" <<EOF
+
+[network]
+proxy_url = "$VSCODE_PROXY_URL"
+EOF
+        log "OK: Codex config (~/.codex/config.toml) proxy_url = $VSCODE_PROXY_URL"
     fi
-
-    cp "$tmp" "$CODE_SETTINGS_FILE"
-    rm -f "$tmp"
-
-    log "OK: VS Code http.proxy = $ELECTRON_PROXY_URL"
 }
 
 
 vscode_restore() {
-    restore_file "$CODE_SETTINGS_FILE" "vscode-settings.json"
+
+    log "Restoring VS Code & Codex settings..."
+
+    # 1. Clean up stale/unmanaged wrappers in /usr/local/bin
+    sudo rm -f /usr/local/bin/code /usr/local/bin/code-oss 2>/dev/null || true
+
+    # 2. Restore VS Code settings.json
+    local settings_file
+    for settings_file in "${CODE_SETTINGS_FILES[@]}"; do
+        local snap_name
+        snap_name="$(basename "$(dirname "$(dirname "$settings_file")")")-vscode-settings.json"
+        restore_file "$settings_file" "$snap_name"
+
+        if [[ -f "$settings_file" ]]; then
+            local tmp
+            tmp="$(mktemp)"
+            if jq 'del(."http.proxy", ."http.proxySupport", ."http.proxyStrictSSL")' "$settings_file" > "$tmp" 2>/dev/null; then
+                cp "$tmp" "$settings_file"
+                rm -f "$tmp"
+            else
+                rm -f "$tmp"
+            fi
+        fi
+    done
+
+    # 3. Restore ~/.codex/config.toml
+    if [[ -f "$CODEX_CONFIG_FILE" ]]; then
+        restore_file "$CODEX_CONFIG_FILE" "codex-config.toml"
+        sed -i '/^[[:space:]]*\[network\]/,/^[[:space:]]*proxy_url[[:space:]]*=/d' "$CODEX_CONFIG_FILE" 2>/dev/null || true
+    fi
+
+    log "OK: VS Code & Codex settings restored"
 }
 
 
 vscode_configuration_matches_active() {
     [[ -f "$CODE_SETTINGS_FILE" ]] &&
         jq -e \
-            --arg proxy "$ELECTRON_PROXY_URL" \
+            --arg proxy "$VSCODE_PROXY_URL" \
             '."http.proxy" == $proxy and ."http.proxySupport" == "override"' \
             "$CODE_SETTINGS_FILE" >/dev/null 2>&1
 }
@@ -1646,10 +1986,36 @@ status() {
 
     fi
 
-    printf "VS Code settings:   "
+    printf "Steam wrapper:      "
+
+    if [[ -x "$USER_STEAM_WRAPPER" ]]; then
+        echo "proxied ($USER_STEAM_WRAPPER)"
+    elif [[ -x "$STEAM_WRAPPER" ]]; then
+        echo "proxied ($STEAM_WRAPPER)"
+    else
+        echo "normal"
+    fi
+
+    printf "Steam launcher:     "
+
+    if [[ -f "$USER_STEAM_DESKTOP" ]] && (grep -q "$USER_STEAM_WRAPPER" "$USER_STEAM_DESKTOP" 2>/dev/null || grep -q "$STEAM_WRAPPER" "$USER_STEAM_DESKTOP" 2>/dev/null); then
+        echo "proxied (GNOME launcher)"
+    else
+        echo "normal"
+    fi
+
+    printf "ProtonUp-Qt / PySocks: "
+
+    if python3 -c "import socks" >/dev/null 2>&1; then
+        echo "installed (OK)"
+    else
+        echo "missing (install: sudo pacman -S python-pysocks)"
+    fi
+
+    printf "VS Code & Codex:    "
 
     if (( active_proxy_loaded )) && vscode_configuration_matches_active; then
-        echo "active $PROXY_TYPE / override"
+        echo "configured ($VSCODE_PROXY_URL / override)"
     elif [[ -f "$CODE_SETTINGS_FILE" ]] &&
          jq -e '."http.proxySupport" == "override" and (."http.proxy" | type == "string")' \
              "$CODE_SETTINGS_FILE" >/dev/null 2>&1; then
@@ -1697,6 +2063,7 @@ enable_proxy() {
     require_sudo
     select_proxy_type
     validate_proxy
+    check_python_socks
     set_proxy_values
 
     log "=============================================="
@@ -1748,6 +2115,7 @@ enable_proxy() {
 
     shelly_wrappers_on
     shelly_desktop_on
+    steam_wrappers_on
     vscode_on
 
     firefox_on
@@ -1755,6 +2123,7 @@ enable_proxy() {
     systemd_on
 
     set_current_proxy_environment
+    install_shell_functions
 
     save_active_proxy
     sudo touch "$ENABLED_FILE"
@@ -1779,8 +2148,13 @@ enable_proxy() {
     echo "[OK] Shelly CLI"
     echo "[OK] Shelly GUI"
     echo "[OK] GNOME Shelly launcher"
+    echo "[OK] Steam wrapper (/usr/local/bin/steam)"
     echo "[OK] VS Code settings / Codex / AI extensions"
     echo "[OK] Firefox → explicit $PROXY_TYPE proxy"
+    if [[ "$PROXY_TYPE" == "socks5" ]] && ! python3 -c "import socks" >/dev/null 2>&1; then
+        echo
+        echo "[WARN] python-pysocks is missing: run 'sudo pacman -S python-pysocks' for ProtonUp-Qt"
+    fi
     echo
     vscode_restart_warning
     echo "Configuration persists across reboot/login."
@@ -1801,49 +2175,31 @@ disable_proxy() {
     log "=============================================="
 
     if ! is_enabled; then
-
-        warn "Persistent proxy state is already DISABLED."
-
-        # OFF must be idempotent.  In particular, an older script version may
-        # have removed its state flag without ever finding the user's Firefox
-        # profile.  Still install Firefox's direct-connection preference when
-        # the user runs OFF again.
-        log "Applying Firefox direct-connection cleanup despite missing state."
-        firefox_off
-        systemd_off
-
-        echo
-        echo "Firefox and runtime proxy cleanup was applied."
-        echo
-        return 0
-
+        warn "Persistent proxy state flag was not set. Performing full cleanup anyway..."
     fi
 
     log "Restoring original system configuration..."
 
     gnome_restore
 
-    restore_file "$ENV_FILE" "environment"
+    environment_off
     restore_file "$PROFILE_FILE" "proxy.sh"
     restore_file "$FISH_PROFILE_FILE" "proxy.fish"
 
     restore_file "$SUDOERS_FILE" "sudoers"
 
-    restore_file "$PACMAN_CONF" "pacman.conf"
-    restore_file "$FLATPAK_CONF" "flatpak-config"
-    restore_file "$PROXYCHAINS_CONF" "proxychains.conf"
+    pacman_off
+    flatpak_off
+    proxychains_off
 
     restore_file "$SHELLY_WRAPPER" "shelly-wrapper"
     restore_file "$SHELLY_UI_WRAPPER" "shelly-ui-wrapper"
 
     shelly_desktop_restore
+    steam_wrappers_off
     vscode_restore
 
-    # Firefox is intentionally forced to DIRECT.
-    # This handles old Firefox proxy settings which may have
-    # survived previous versions of this script.
     firefox_off
-
     systemd_off
     clear_current_proxy_environment
 
@@ -1852,6 +2208,7 @@ disable_proxy() {
         2>/dev/null || true
 
     clear_state
+    install_shell_functions
 
     vscode_restart_warning
 
@@ -1861,13 +2218,12 @@ disable_proxy() {
     echo "=============================================="
     echo
     echo "System proxy configuration restored."
+    echo "GNOME proxy set to DIRECT / NONE."
     echo "Firefox forced to DIRECT / NO PROXY."
+    echo "Pacman, Flatpak & Proxychains sanitized."
     echo "VS Code settings restored."
     echo
-    echo "IMPORTANT:"
-    echo "  Fully close Firefox and open it again."
-    echo "  Open a new terminal to clear old shell variables."
-    echo
+    echo "Shell integration: 'zoupsproxy off' also unsets live variables in fish."
     echo "=============================================="
 }
 
