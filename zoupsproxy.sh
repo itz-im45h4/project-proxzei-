@@ -79,6 +79,8 @@ USER_STEAM_DESKTOP="$USER_APPS_DIR/steam.desktop"
 CODE_SETTINGS_FILES=(
     "$HOME/.config/Code - OSS/User/settings.json"
     "$HOME/.config/Code/User/settings.json"
+    "$HOME/.config/Cursor/User/settings.json"
+    "$HOME/.config/Antigravity IDE/User/settings.json"
 )
 CODE_SETTINGS_FILE="${CODE_SETTINGS_FILES[0]}"
 CODEX_CONFIG_FILE="$HOME/.codex/config.toml"
@@ -737,38 +739,22 @@ systemd_off() {
         no_proxy NO_PROXY \
         2>/dev/null || true
 
-    systemctl --user unset-environment \
-        http_proxy https_proxy \
-        HTTP_PROXY HTTPS_PROXY \
-        ftp_proxy FTP_PROXY \
-        all_proxy ALL_PROXY \
-        no_proxy NO_PROXY \
+    systemctl --user set-environment \
+        http_proxy="" https_proxy="" \
+        HTTP_PROXY="" HTTPS_PROXY="" \
+        ftp_proxy="" FTP_PROXY="" \
+        all_proxy="" ALL_PROXY="" \
+        no_proxy="" NO_PROXY="" \
         2>/dev/null || true
-
-    # If any proxy variables linger in systemd --user (for example, if systemd was
-    # started when /etc/environment had proxy variables), unsetting them can unmask
-    # the initial environment. Set them to empty values so new terminals/apps do not
-    # inherit a stale proxy.
-    local lingering
-    lingering="$(systemctl --user show-environment 2>/dev/null | grep -E '^(http_proxy|https_proxy|HTTP_PROXY|HTTPS_PROXY|ftp_proxy|FTP_PROXY|all_proxy|ALL_PROXY)=.+' || true)"
-    if [[ -n "$lingering" ]]; then
-        systemctl --user set-environment \
-            http_proxy= https_proxy= \
-            HTTP_PROXY= HTTPS_PROXY= \
-            ftp_proxy= FTP_PROXY= \
-            all_proxy= ALL_PROXY= \
-            no_proxy= NO_PROXY= \
-            2>/dev/null || true
-    fi
 
     # Ensure D-Bus session activation environment is also sanitized.
     if command -v dbus-update-activation-environment >/dev/null 2>&1; then
         dbus-update-activation-environment --systemd \
-            http_proxy= https_proxy= \
-            HTTP_PROXY= HTTPS_PROXY= \
-            ftp_proxy= FTP_PROXY= \
-            all_proxy= ALL_PROXY= \
-            no_proxy= NO_PROXY= \
+            http_proxy="" https_proxy="" \
+            HTTP_PROXY="" HTTPS_PROXY="" \
+            ftp_proxy="" FTP_PROXY="" \
+            all_proxy="" ALL_PROXY="" \
+            no_proxy="" NO_PROXY="" \
             2>/dev/null || true
     fi
 }
@@ -1754,7 +1740,7 @@ vscode_on() {
 
             if jq \
                 --arg proxy "$VSCODE_PROXY_URL" \
-                '. + {"http.proxy": $proxy, "http.proxySupport": "override", "http.proxyStrictSSL": false}' \
+                '. + {"http.proxy": $proxy, "http.proxySupport": "override", "http.proxyStrictSSL": false, "cursor.general.disableHttp2": true}' \
                 "$settings_file" > "$tmp"; then
                 cp "$tmp" "$settings_file"
                 rm -f "$tmp"
@@ -1800,7 +1786,7 @@ vscode_restore() {
         if [[ -f "$settings_file" ]]; then
             local tmp
             tmp="$(mktemp)"
-            if jq 'del(."http.proxy", ."http.proxySupport", ."http.proxyStrictSSL")' "$settings_file" > "$tmp" 2>/dev/null; then
+            if jq 'del(."http.proxy", ."http.proxySupport", ."http.proxyStrictSSL", ."cursor.general.disableHttp2")' "$settings_file" > "$tmp" 2>/dev/null; then
                 cp "$tmp" "$settings_file"
                 rm -f "$tmp"
             else
@@ -1829,8 +1815,8 @@ vscode_configuration_matches_active() {
 
 
 vscode_restart_warning() {
-    if pgrep -u "$UID" -f '(^|/)(code|code-oss)( |$)' >/dev/null 2>&1; then
-        warn "VS Code is still running. Fully close and reopen it so Codex and other extensions read the new settings."
+    if pgrep -u "$UID" -f '(^|/)(code|code-oss|cursor)( |$)' >/dev/null 2>&1; then
+        warn "VS Code / Cursor is still running. Fully close and reopen it so Codex, Cursor, and extensions read the new settings."
     fi
 }
 
