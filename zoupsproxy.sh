@@ -1481,8 +1481,12 @@ shelly_wrappers_on() {
 
     log "Configuring Shelly wrappers..."
 
-    snapshot_file "$SHELLY_WRAPPER" "shelly-wrapper"
-    snapshot_file "$SHELLY_UI_WRAPPER" "shelly-ui-wrapper"
+    if ! grep -q "proxychains4" "$SHELLY_WRAPPER" 2>/dev/null; then
+        snapshot_file "$SHELLY_WRAPPER" "shelly-wrapper"
+    fi
+    if ! grep -q "proxychains4" "$SHELLY_UI_WRAPPER" 2>/dev/null; then
+        snapshot_file "$SHELLY_UI_WRAPPER" "shelly-ui-wrapper"
+    fi
 
     sudo mkdir -p /usr/local/bin
 
@@ -1502,6 +1506,13 @@ EOF
 
     log "OK: Shelly CLI wrapper"
     log "OK: Shelly UI wrapper"
+}
+
+shelly_wrappers_off() {
+    restore_file "$SHELLY_WRAPPER" "shelly-wrapper"
+    restore_file "$SHELLY_UI_WRAPPER" "shelly-ui-wrapper"
+    sudo rm -f "$SHELLY_WRAPPER" "$SHELLY_UI_WRAPPER" 2>/dev/null || true
+    log "OK: Shelly wrappers removed"
 }
 
 
@@ -2178,9 +2189,7 @@ disable_proxy() {
     flatpak_off
     proxychains_off
 
-    restore_file "$SHELLY_WRAPPER" "shelly-wrapper"
-    restore_file "$SHELLY_UI_WRAPPER" "shelly-ui-wrapper"
-
+    shelly_wrappers_off
     shelly_desktop_restore
     steam_wrappers_off
     vscode_restore
